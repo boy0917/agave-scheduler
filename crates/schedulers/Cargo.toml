@@ -16,7 +16,6 @@ batch = [
   "dep:crossbeam-channel",
   "dep:eyre",
   "dep:futures",
-  "dep:indexmap",
   "dep:jito-protos",
   "dep:solana-hash",
   "dep:solana-keypair",
@@ -45,7 +44,7 @@ crossbeam-channel = { workspace = true, optional = true }
 eyre = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 hashbrown.workspace = true
-indexmap = { workspace = true, optional = true }
+indexmap.workspace = true
 jito-protos = { workspace = true, optional = true }
 metrics.workspace = true
 min-max-heap.workspace = true

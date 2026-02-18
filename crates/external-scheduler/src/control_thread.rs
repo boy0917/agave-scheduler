@@ -3,7 +3,7 @@ use std::time::Duration;
 use agave_schedulers::batch;
 use agave_schedulers::events::{EventContext, EventEmitter};
 use agave_schedulers::fifo::FifoScheduler;
-use agave_schedulers::greedy::GreedyScheduler;
+use agave_schedulers::greedy::{GreedyArgs, GreedyScheduler};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use solana_keypair::{EncodableKey, Keypair};
@@ -105,7 +105,10 @@ impl ControlThread {
                 threads.push(crate::scheduler_thread::spawn::<GreedyScheduler>(
                     shutdown.clone(),
                     args.bindings_ipc,
-                    GreedyScheduler::new(Some(events)),
+                    GreedyScheduler::new(
+                        Some(events),
+                        GreedyArgs { unchecked_capacity: 64 * 1024, checked_capacity: 64 * 1024 },
+                    ),
                 ));
             }
         }
