@@ -14,6 +14,7 @@ pub(crate) fn spawn<S>(
     shutdown: Shutdown,
     bindings_ipc: PathBuf,
     mut scheduler: S,
+    worker_count: usize,
 ) -> JoinHandle<()>
 where
     S: Scheduler + Send,
@@ -24,7 +25,7 @@ where
             let session = handshake_client::connect(
                 &bindings_ipc,
                 ClientLogon {
-                    worker_count: 5,
+                    worker_count,
                     // 2GB allocator size.
                     allocator_size: 2 * 1024 * 1024 * 1024,
                     allocator_handles: 1,

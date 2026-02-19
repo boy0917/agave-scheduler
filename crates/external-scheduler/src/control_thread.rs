@@ -93,6 +93,7 @@ impl ControlThread {
                     shutdown.clone(),
                     args.bindings_ipc,
                     scheduler,
+                    5,
                 ));
                 threads.push(jito_thread);
             }
@@ -100,6 +101,7 @@ impl ControlThread {
                 shutdown.clone(),
                 args.bindings_ipc,
                 FifoScheduler::new(),
+                4,
             )),
             SchedulerConfig::Greedy => {
                 threads.push(crate::scheduler_thread::spawn::<GreedyScheduler>(
@@ -113,6 +115,7 @@ impl ControlThread {
                             checked_capacity: 64 * 1024,
                         },
                     ),
+                    5,
                 ));
             }
         }
