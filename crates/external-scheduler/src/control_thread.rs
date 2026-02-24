@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use agave_scheduler_batch::{BatchScheduler, BatchSchedulerArgs, JitoArgs, TipDistributionArgs};
@@ -58,7 +59,7 @@ impl ControlThread {
         );
 
         // Spawn events publisher.
-        let event_ctx = EventContext::leak();
+        let event_ctx = EventContext::new();
         let (event_tx, event_rx) = mpsc::channel(1024);
         let events = EventEmitter::new(event_ctx, event_tx);
         threads.push(EventsThread::spawn(event_rx, nats_client, &config.host_name));
@@ -66,8 +67,7 @@ impl ControlThread {
         // Setup scheduler.
         match config.scheduler {
             SchedulerConfig::Batch(batch) => {
-                let keypair =
-                    Box::leak(Box::new(Keypair::read_from_file(batch.keypair_path).unwrap()));
+                let keypair = Arc::new(Keypair::read_from_file(batch.keypair_path).unwrap());
                 let (scheduler, jito_thread) = BatchScheduler::new(
                     shutdown.clone(),
                     Some(events),
