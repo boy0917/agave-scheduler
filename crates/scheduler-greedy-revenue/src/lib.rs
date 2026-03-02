@@ -78,7 +78,7 @@ pub struct GreedyRevenueScheduler {
     events: Option<EventEmitter>,
     slot: Slot,
     slot_stats: SlotStatsEvent,
-    metrics: BatchMetrics,
+    metrics: GreedyRevenueMetrics,
 }
 
 impl GreedyRevenueScheduler {
@@ -107,7 +107,7 @@ impl GreedyRevenueScheduler {
             events,
             slot: 0,
             slot_stats: SlotStatsEvent::default(),
-            metrics: BatchMetrics::new(),
+            metrics: GreedyRevenueMetrics::new(),
         }
     }
 
@@ -770,7 +770,7 @@ impl GreedyRevenueScheduler {
     }
 }
 
-struct BatchMetrics {
+struct GreedyRevenueMetrics {
     current_slot: Gauge,
     next_leader_slot: Gauge,
 
@@ -798,7 +798,7 @@ struct BatchMetrics {
     execute_evict: Counter,
 }
 
-impl BatchMetrics {
+impl GreedyRevenueMetrics {
     fn new() -> Self {
         Self {
             current_slot: gauge!("slot", "label" => "current"),

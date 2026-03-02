@@ -78,7 +78,7 @@ pub struct GreedyThroughputScheduler {
     events: Option<EventEmitter>,
     slot: Slot,
     slot_stats: SlotStatsEvent,
-    metrics: BatchMetrics,
+    metrics: GreedyThroughputMetrics,
 }
 
 impl GreedyThroughputScheduler {
@@ -107,7 +107,7 @@ impl GreedyThroughputScheduler {
             events,
             slot: 0,
             slot_stats: SlotStatsEvent::default(),
-            metrics: BatchMetrics::new(),
+            metrics: GreedyThroughputMetrics::new(),
         }
     }
 
@@ -777,7 +777,7 @@ impl GreedyThroughputScheduler {
     }
 }
 
-struct BatchMetrics {
+struct GreedyThroughputMetrics {
     current_slot: Gauge,
     next_leader_slot: Gauge,
 
@@ -805,7 +805,7 @@ struct BatchMetrics {
     execute_evict: Counter,
 }
 
-impl BatchMetrics {
+impl GreedyThroughputMetrics {
     fn new() -> Self {
         Self {
             current_slot: gauge!("slot", "label" => "current"),
