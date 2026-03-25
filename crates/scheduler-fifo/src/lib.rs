@@ -1,14 +1,14 @@
 use std::collections::VecDeque;
 
-use agave_bridge::{
-    Bridge, KeyedTransactionMeta, ScheduleBatch, TransactionKey, TxDecision, Worker, WorkerAction,
-    WorkerResponse,
-};
 use agave_scheduler_bindings::pack_message_flags::check_flags;
 use agave_scheduler_bindings::worker_message_types::{
     parsing_and_sanitization_flags, status_check_flags,
 };
 use agave_scheduler_bindings::{LEADER_READY, MAX_TRANSACTIONS_PER_MESSAGE, pack_message_flags};
+use agave_scheduling_utils::bridge::{
+    KeyedTransactionMeta, ScheduleBatch, SchedulerBindingsBridge, TransactionKey, TxDecision,
+    WorkerAction, WorkerResponse,
+};
 
 const CHECK_WORKER: usize = 0;
 const EXECUTE_WORKER: usize = 1;
@@ -29,15 +29,12 @@ impl FifoScheduler {
         }
     }
 
-    pub fn poll<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = ()>,
-    {
+    pub fn poll(&mut self, bridge: &mut SchedulerBindingsBridge<()>) {
         // Drain the progress tracker so we know which slot we're on.
         let _ = bridge.drain_progress();
 
         // Drain check responses.
-        bridge.worker_drain(
+        bridge.drain_worker(
             CHECK_WORKER,
             |_, WorkerResponse { key, response, .. }| {
                 let WorkerAction::Check(rep, _) = response else {
@@ -64,7 +61,7 @@ impl FifoScheduler {
         );
 
         // Drain execute responses.
-        bridge.worker_drain(
+        bridge.drain_worker(
             EXECUTE_WORKER,
             |_, WorkerResponse { .. }| TxDecision::Drop,
             usize::MAX,
@@ -75,7 +72,7 @@ impl FifoScheduler {
             true => 128,
             false => 1024,
         };
-        bridge.tpu_drain(
+        bridge.drain_tpu(
             |_, key| {
                 self.check_queue.push_back(key);
 
@@ -88,10 +85,7 @@ impl FifoScheduler {
         self.schedule(bridge);
     }
 
-    fn schedule<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = ()>,
-    {
+    fn schedule(&mut self, bridge: &mut SchedulerBindingsBridge<()>) {
         // Schedule additional checks.
         while !bridge.worker(CHECK_WORKER).is_empty() {
             self.batch.clear();
@@ -100,20 +94,22 @@ impl FifoScheduler {
                     .take(MAX_TRANSACTIONS_PER_MESSAGE)
                     .map(|key| KeyedTransactionMeta { key, meta: () }),
             );
-            bridge.schedule(ScheduleBatch {
-                worker: CHECK_WORKER,
-                transactions: &self.batch,
-                max_working_slot: u64::MAX,
-                flags: pack_message_flags::CHECK
-                    | check_flags::STATUS_CHECKS
-                    | check_flags::LOAD_FEE_PAYER_BALANCE
-                    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES,
-            });
+            bridge
+                .schedule(ScheduleBatch {
+                    worker: CHECK_WORKER,
+                    transactions: &self.batch,
+                    max_working_slot: u64::MAX,
+                    flags: pack_message_flags::CHECK
+                        | check_flags::STATUS_CHECKS
+                        | check_flags::LOAD_FEE_PAYER_BALANCE
+                        | check_flags::LOAD_ADDRESS_LOOKUP_TABLES,
+                })
+                .unwrap();
         }
 
         // If we are the leader, schedule executes.
         if bridge.progress().leader_state == LEADER_READY
-            && bridge.worker(EXECUTE_WORKER).len() == 0
+            && bridge.worker(EXECUTE_WORKER).is_empty()
         {
             self.batch.clear();
             self.batch.extend(
@@ -121,12 +117,14 @@ impl FifoScheduler {
                     .take(MAX_TRANSACTIONS_PER_MESSAGE)
                     .map(|key| KeyedTransactionMeta { key, meta: () }),
             );
-            bridge.schedule(ScheduleBatch {
-                worker: EXECUTE_WORKER,
-                transactions: &self.batch,
-                max_working_slot: bridge.progress().current_slot + 1,
-                flags: pack_message_flags::EXECUTE,
-            });
+            bridge
+                .schedule(ScheduleBatch {
+                    worker: EXECUTE_WORKER,
+                    transactions: &self.batch,
+                    max_working_slot: bridge.progress().current_slot + 1,
+                    flags: pack_message_flags::EXECUTE,
+                })
+                .unwrap();
         }
     }
 }

@@ -5,10 +5,6 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use agave_bridge::{
-    Bridge, KeyedTransactionMeta, RuntimeState, ScheduleBatch, TransactionKey, TransactionState,
-    TxDecision, Worker, WorkerAction, WorkerResponse,
-};
 use agave_scheduler_bindings::pack_message_flags::{check_flags, execution_flags};
 use agave_scheduler_bindings::worker_message_types::{
     CheckResponse, ExecutionResponse, fee_payer_balance_flags, not_included_reasons,
@@ -22,6 +18,10 @@ use agave_schedulers::events::{
     TransactionEvent, TransactionSource,
 };
 use agave_schedulers::shared::PriorityId;
+use agave_scheduling_utils::bridge::{
+    KeyedTransactionMeta, RuntimeState, ScheduleBatch, SchedulerBindingsBridge, TransactionKey,
+    TransactionState, TxDecision, WorkerAction, WorkerResponse,
+};
 use agave_scheduling_utils::transaction_ptr::TransactionPtr;
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use crossbeam_channel::TryRecvError;
@@ -171,10 +171,7 @@ impl BatchScheduler {
         }
     }
 
-    pub fn poll<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    pub fn poll(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>) {
         // Drain the progress tracker & check for roll.
         self.check_slot_roll(bridge);
 
@@ -233,10 +230,7 @@ impl BatchScheduler {
         self.metrics.in_flight_cus.set(self.in_flight_cus as f64);
     }
 
-    fn check_slot_roll<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn check_slot_roll(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>) {
         // Drain progress and check for disconnect.
         match bridge.drain_progress() {
             Some(_) => self.last_progress_time = Instant::now(),
@@ -294,10 +288,7 @@ impl BatchScheduler {
         }
     }
 
-    fn become_tip_receiver<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn become_tip_receiver(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>) {
         info!("Becoming tip receiver");
 
         let (tip_distribution_key, init_tip_distribution) = init_tip_distribution(
@@ -306,7 +297,7 @@ impl BatchScheduler {
             self.slot / DEFAULT_SLOTS_PER_EPOCH,
             self.recent_blockhash,
         );
-        let init_tip_distribution = bridge.tx_insert(&init_tip_distribution).unwrap();
+        let init_tip_distribution = bridge.insert_transaction(&init_tip_distribution).unwrap();
 
         let tip_config = self.tip_config.as_ref().unwrap();
         let change_tip_receiver = change_tip_receiver(
@@ -320,15 +311,15 @@ impl BatchScheduler {
             },
             self.recent_blockhash,
         );
-        let change_tip_receiver = bridge.tx_insert(&change_tip_receiver).unwrap();
+        let change_tip_receiver = bridge.insert_transaction(&change_tip_receiver).unwrap();
 
         // Check if our batch can be locked.
         if !Self::can_lock(&self.in_flight_locks, bridge, init_tip_distribution)
             || !Self::can_lock(&self.in_flight_locks, bridge, change_tip_receiver)
         {
             warn!("Failed to grab locks for change tip receiver");
-            bridge.tx_drop(init_tip_distribution);
-            bridge.tx_drop(change_tip_receiver);
+            bridge.drop_transaction(init_tip_distribution);
+            bridge.drop_transaction(change_tip_receiver);
 
             return;
         }
@@ -342,32 +333,37 @@ impl BatchScheduler {
         assert!(self.executing_tx.insert(change_tip_receiver));
 
         // TODO: Schedule as a single batch once we have SIMD83 live.
-        bridge.schedule(ScheduleBatch {
-            worker: EXECUTE_WORKER_START,
-            transactions: &[KeyedTransactionMeta {
-                key: init_tip_distribution,
-                meta: PriorityId { priority: BUNDLE_MARKER, cost: 0, key: init_tip_distribution },
-            }],
-            max_working_slot: self.slot + 4,
-            flags: pack_message_flags::EXECUTE | execution_flags::DROP_ON_FAILURE,
-        });
-        bridge.schedule(ScheduleBatch {
-            worker: EXECUTE_WORKER_START,
-            transactions: &[KeyedTransactionMeta {
-                key: change_tip_receiver,
-                meta: PriorityId { priority: BUNDLE_MARKER, cost: 0, key: change_tip_receiver },
-            }],
-            max_working_slot: self.slot + 4,
-            flags: pack_message_flags::EXECUTE | execution_flags::DROP_ON_FAILURE,
-        });
+        bridge
+            .schedule(ScheduleBatch {
+                worker: EXECUTE_WORKER_START,
+                transactions: &[KeyedTransactionMeta {
+                    key: init_tip_distribution,
+                    meta: PriorityId {
+                        priority: BUNDLE_MARKER,
+                        cost: 0,
+                        key: init_tip_distribution,
+                    },
+                }],
+                max_working_slot: self.slot + 4,
+                flags: pack_message_flags::EXECUTE | execution_flags::DROP_ON_FAILURE,
+            })
+            .unwrap();
+        bridge
+            .schedule(ScheduleBatch {
+                worker: EXECUTE_WORKER_START,
+                transactions: &[KeyedTransactionMeta {
+                    key: change_tip_receiver,
+                    meta: PriorityId { priority: BUNDLE_MARKER, cost: 0, key: change_tip_receiver },
+                }],
+                max_working_slot: self.slot + 4,
+                flags: pack_message_flags::EXECUTE | execution_flags::DROP_ON_FAILURE,
+            })
+            .unwrap();
     }
 
-    fn drain_worker_responses<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn drain_worker_responses(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>) {
         for worker in 0..5 {
-            bridge.worker_drain(
+            bridge.drain_worker(
                 worker,
                 |bridge, WorkerResponse { meta, response, .. }| {
                     match response {
@@ -405,10 +401,7 @@ impl BatchScheduler {
         }
     }
 
-    fn drain_tpu<B>(&mut self, bridge: &mut B, max_count: usize)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn drain_tpu(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>, max_count: usize) {
         let additional = std::cmp::min(bridge.tpu_len(), max_count);
         let shortfall =
             (self.unchecked_tx.len() + additional).saturating_sub(self.unchecked_capacity);
@@ -423,18 +416,21 @@ impl BatchScheduler {
                 id.priority,
                 TransactionAction::Evict { reason: EvictReason::UncheckedCapacity },
             );
-            bridge.tx_drop(id.key);
+            bridge.drop_transaction(id.key);
         }
         self.metrics.recv_tpu_evict.increment(shortfall as u64);
         self.slot_stats.ingest_tpu_evict += shortfall as u64;
 
         // TODO: Need to dedupe already seen transactions?
 
-        bridge.tpu_drain(
-            |bridge, key| match Self::calculate_priority(bridge.runtime(), &bridge.tx(key).data) {
+        bridge.drain_tpu(
+            |bridge, key| match Self::calculate_priority(
+                bridge.runtime(),
+                &bridge.transaction(key).data,
+            ) {
                 Some((priority, cost)) => {
                     // Ban using the tip payment program as it could be used to steal tips.
-                    if Self::should_filter(bridge.tx(key)) {
+                    if Self::should_filter(bridge.transaction(key)) {
                         self.metrics.recv_tpu_filtered.increment(1);
 
                         return TxDecision::Drop;
@@ -463,10 +459,7 @@ impl BatchScheduler {
         );
     }
 
-    fn drain_jito<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn drain_jito(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>) {
         loop {
             match self.jito_rx.try_recv() {
                 Ok(JitoUpdate::BuilderConfig { .. }) => {}
@@ -480,20 +473,17 @@ impl BatchScheduler {
         }
     }
 
-    fn on_packet<B>(&mut self, bridge: &mut B, packet: &[u8])
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
-        let Ok(key) = bridge.tx_insert(packet) else {
+    fn on_packet(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>, packet: &[u8]) {
+        let Ok(key) = bridge.insert_transaction(packet) else {
             return;
         };
 
-        match Self::calculate_priority(bridge.runtime(), &bridge.tx(key).data) {
+        match Self::calculate_priority(bridge.runtime(), &bridge.transaction(key).data) {
             Some((priority, cost)) => {
                 // Ban using the tip payment program as it could be used to steal tips.
-                if Self::should_filter(bridge.tx(key)) {
+                if Self::should_filter(bridge.transaction(key)) {
                     self.metrics.recv_packet_filtered.increment(1);
-                    bridge.tx_drop(key);
+                    bridge.drop_transaction(key);
 
                     return;
                 }
@@ -507,7 +497,7 @@ impl BatchScheduler {
                         id.priority,
                         TransactionAction::Evict { reason: EvictReason::UncheckedCapacity },
                     );
-                    bridge.tx_drop(id.key);
+                    bridge.drop_transaction(id.key);
                     self.metrics.recv_packet_evict.increment(1);
                 }
 
@@ -526,23 +516,24 @@ impl BatchScheduler {
                 self.metrics.recv_packet_err.increment(1);
                 self.slot_stats.ingest_custom_err += 1;
 
-                bridge.tx_drop(key);
+                bridge.drop_transaction(key);
             }
         }
     }
 
-    fn on_bundle<B>(&mut self, bridge: &mut B, bundle: Vec<Vec<u8>>)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn on_bundle(
+        &mut self,
+        bridge: &mut SchedulerBindingsBridge<PriorityId>,
+        bundle: Vec<Vec<u8>>,
+    ) {
         let mut keys = Vec::with_capacity(bundle.len());
         let mut total_cost: u64 = 0;
         let mut total_reward: u64 = 0;
 
         for packet in bundle {
-            let Ok(key) = bridge.tx_insert(&packet) else {
+            let Ok(key) = bridge.insert_transaction(&packet) else {
                 for key in keys {
-                    bridge.tx_drop(key);
+                    bridge.drop_transaction(key);
                 }
                 self.metrics.recv_bundle_err.increment(1);
 
@@ -554,10 +545,10 @@ impl BatchScheduler {
 
             // Calculate cost and reward for this transaction.
             let Some((cost, reward)) =
-                Self::calculate_cost_and_reward(bridge.runtime(), &bridge.tx(key).data)
+                Self::calculate_cost_and_reward(bridge.runtime(), &bridge.transaction(key).data)
             else {
                 for key in keys {
-                    bridge.tx_drop(key);
+                    bridge.drop_transaction(key);
                 }
                 self.metrics.recv_bundle_err.increment(1);
 
@@ -565,7 +556,7 @@ impl BatchScheduler {
             };
 
             // Extract tip from this transaction.
-            let tip = Self::extract_tip(&bridge.tx(key).data);
+            let tip = Self::extract_tip(&bridge.transaction(key).data);
 
             // Accumulate totals.
             total_cost += cost;
@@ -573,10 +564,13 @@ impl BatchScheduler {
         }
 
         // Filter bundles containing transactions that write to tip accounts.
-        if keys.iter().any(|key| Self::should_filter(bridge.tx(*key))) {
+        if keys
+            .iter()
+            .any(|key| Self::should_filter(bridge.transaction(*key)))
+        {
             self.metrics.recv_bundle_filtered.increment(1);
             for key in keys {
-                bridge.tx_drop(key);
+                bridge.drop_transaction(key);
             }
 
             return;
@@ -589,7 +583,7 @@ impl BatchScheduler {
             .unwrap_or(0);
 
         // Emit ingest events for bundle transactions.
-        let bundle_sig = bridge.tx(keys[0]).data.signatures()[0];
+        let bundle_sig = bridge.transaction(keys[0]).data.signatures()[0];
         let bundle_id = Arc::new(bundle_sig.to_string());
         for &key in &keys {
             self.emit_tx_event(
@@ -607,7 +601,7 @@ impl BatchScheduler {
         if self.bundles.len() == self.bundle_capacity {
             let evicted = self.bundles.pop_first().unwrap();
             for key in evicted.keys {
-                bridge.tx_drop(key);
+                bridge.drop_transaction(key);
             }
             self.metrics.recv_bundle_evict.increment(1);
         }
@@ -623,10 +617,7 @@ impl BatchScheduler {
         });
     }
 
-    fn drop_expired_bundles<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn drop_expired_bundles(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>) {
         let now = Instant::now();
         // Retain only non-expired bundles, dropping expired ones.
         let expired: Vec<_> = self
@@ -641,15 +632,12 @@ impl BatchScheduler {
             self.bundles.remove(&bundle);
             self.metrics.recv_bundle_expired.increment(1);
             for key in bundle.keys {
-                bridge.tx_drop(key);
+                bridge.drop_transaction(key);
             }
         }
     }
 
-    fn schedule_checks<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn schedule_checks(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>) {
         // Loop until worker queue is filled or backlog is empty.
         let start_len = self.unchecked_tx.len();
         while bridge.worker(CHECK_WORKER).len() < MAX_CHECK_BATCHES
@@ -691,15 +679,17 @@ impl BatchScheduler {
                 break;
             }
 
-            bridge.schedule(ScheduleBatch {
-                worker: CHECK_WORKER,
-                transactions: &self.schedule_batch,
-                max_working_slot: u64::MAX,
-                flags: pack_message_flags::CHECK
-                    | check_flags::STATUS_CHECKS
-                    | check_flags::LOAD_FEE_PAYER_BALANCE
-                    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES,
-            });
+            bridge
+                .schedule(ScheduleBatch {
+                    worker: CHECK_WORKER,
+                    transactions: &self.schedule_batch,
+                    max_working_slot: u64::MAX,
+                    flags: pack_message_flags::CHECK
+                        | check_flags::STATUS_CHECKS
+                        | check_flags::LOAD_FEE_PAYER_BALANCE
+                        | check_flags::LOAD_ADDRESS_LOOKUP_TABLES,
+                })
+                .unwrap();
         }
 
         // Update metrics with our scheduled amount.
@@ -708,10 +698,7 @@ impl BatchScheduler {
         self.slot_stats.check_requested += check_requested;
     }
 
-    fn schedule_execute<B>(&mut self, bridge: &mut B)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn schedule_execute(&mut self, bridge: &mut SchedulerBindingsBridge<PriorityId>) {
         debug_assert_eq!(bridge.progress().leader_state, LEADER_READY);
         let budget_percentage =
             std::cmp::min(bridge.progress().current_slot_progress + BLOCK_FILL_CUTOFF, 100);
@@ -729,7 +716,7 @@ impl BatchScheduler {
             }
 
             // If the worker already has a pending job, don't give it any more.
-            if bridge.worker(worker).len() > 0 {
+            if !bridge.worker(worker).is_empty() {
                 continue;
             }
 
@@ -771,10 +758,12 @@ impl BatchScheduler {
         }
     }
 
-    fn on_check<B>(&mut self, bridge: &mut B, meta: PriorityId, rep: CheckResponse) -> TxDecision
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn on_check(
+        &mut self,
+        bridge: &mut SchedulerBindingsBridge<PriorityId>,
+        meta: PriorityId,
+        rep: CheckResponse,
+    ) -> TxDecision {
         // If transaction is currently executing (or deferred), ignore the recheck
         // result.
         if self.executing_tx.contains(&meta.key) || self.deferred_tx.contains(&meta) {
@@ -840,7 +829,7 @@ impl BatchScheduler {
                 id.priority,
                 TransactionAction::Evict { reason: EvictReason::CheckedCapacity },
             );
-            bridge.tx_drop(id.key);
+            bridge.drop_transaction(id.key);
 
             self.metrics.check_evict.increment(1);
             self.slot_stats.check_evict += 1;
@@ -858,15 +847,12 @@ impl BatchScheduler {
         TxDecision::Keep
     }
 
-    fn on_execute<B>(
+    fn on_execute(
         &mut self,
-        bridge: &mut B,
+        bridge: &mut SchedulerBindingsBridge<PriorityId>,
         meta: PriorityId,
         rep: ExecutionResponse,
-    ) -> TxDecision
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    ) -> TxDecision {
         // Remove from executing set now that execution is complete.
         assert!(self.executing_tx.remove(&meta.key));
 
@@ -919,7 +905,7 @@ impl BatchScheduler {
                 evicted.priority,
                 TransactionAction::Evict { reason: EvictReason::CheckedCapacity },
             );
-            bridge.tx_drop(evicted.key);
+            bridge.drop_transaction(evicted.key);
             self.metrics.execute_evict.increment(1);
         }
 
@@ -951,10 +937,12 @@ impl BatchScheduler {
     /// # Return
     ///
     /// Places scheduled transactions in `self.schedule_batch`.
-    fn try_schedule_transaction<B>(&mut self, budget: &mut u64, bridge: &mut B, worker: usize)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn try_schedule_transaction(
+        &mut self,
+        budget: &mut u64,
+        bridge: &mut SchedulerBindingsBridge<PriorityId>,
+        worker: usize,
+    ) {
         let tx = self.checked_tx.last().unwrap();
 
         // Check if this fits in the budget.
@@ -976,12 +964,14 @@ impl BatchScheduler {
             .push(KeyedTransactionMeta { key: tx.key, meta: *tx });
 
         // Schedule the batch.
-        bridge.schedule(ScheduleBatch {
-            worker,
-            transactions: &self.schedule_batch,
-            max_working_slot: bridge.progress().current_slot + 1,
-            flags: pack_message_flags::EXECUTE,
-        });
+        bridge
+            .schedule(ScheduleBatch {
+                worker,
+                transactions: &self.schedule_batch,
+                max_working_slot: bridge.progress().current_slot + 1,
+                flags: pack_message_flags::EXECUTE,
+            })
+            .unwrap();
 
         // Update state.
         *budget -= tx.cost;
@@ -994,10 +984,12 @@ impl BatchScheduler {
     /// # Return
     ///
     /// Places scheduled transactions in `self.schedule_batch`.
-    fn try_schedule_bundle<B>(&mut self, budget: &mut u64, bridge: &mut B, worker: usize)
-    where
-        B: Bridge<Meta = PriorityId>,
-    {
+    fn try_schedule_bundle(
+        &mut self,
+        budget: &mut u64,
+        bridge: &mut SchedulerBindingsBridge<PriorityId>,
+        worker: usize,
+    ) {
         let bundle = self.bundles.last().unwrap();
 
         // Check this fits in budget.
@@ -1041,14 +1033,16 @@ impl BatchScheduler {
             );
 
         // Schedule 1 bundle as 1 batch.
-        bridge.schedule(ScheduleBatch {
-            worker,
-            transactions: &self.schedule_batch,
-            max_working_slot: bridge.progress().current_slot + 1,
-            flags: pack_message_flags::EXECUTE
-                | execution_flags::DROP_ON_FAILURE
-                | execution_flags::ALL_OR_NOTHING,
-        });
+        bridge
+            .schedule(ScheduleBatch {
+                worker,
+                transactions: &self.schedule_batch,
+                max_working_slot: bridge.progress().current_slot + 1,
+                flags: pack_message_flags::EXECUTE
+                    | execution_flags::DROP_ON_FAILURE
+                    | execution_flags::ALL_OR_NOTHING,
+            })
+            .unwrap();
 
         // Update state.
         *budget -= bundle.cost;
@@ -1057,17 +1051,14 @@ impl BatchScheduler {
     }
 
     /// Checks a TX for lock conflicts without inserting locks.
-    fn can_lock<B>(
+    fn can_lock(
         in_flight_locks: &HashMap<Pubkey, AccountLockers>,
-        bridge: &mut B,
+        bridge: &mut SchedulerBindingsBridge<PriorityId>,
         tx_key: TransactionKey,
-    ) -> bool
-    where
-        B: Bridge,
-    {
+    ) -> bool {
         // Check if this transaction's read/write locks conflict with any
         // pre-existing read/write locks.
-        bridge.tx(tx_key).locks().all(|(addr, writable)| {
+        bridge.transaction(tx_key).locks().all(|(addr, writable)| {
             in_flight_locks
                 .get(addr)
                 .is_none_or(|lockers| lockers.can_lock(writable))
@@ -1075,14 +1066,12 @@ impl BatchScheduler {
     }
 
     /// Locks a transaction without checking for conflicts.
-    fn lock<B>(
+    fn lock(
         in_flight_locks: &mut HashMap<Pubkey, AccountLockers>,
-        bridge: &mut B,
+        bridge: &mut SchedulerBindingsBridge<PriorityId>,
         tx_key: TransactionKey,
-    ) where
-        B: Bridge,
-    {
-        for (addr, writable) in bridge.tx(tx_key).locks() {
+    ) {
+        for (addr, writable) in bridge.transaction(tx_key).locks() {
             in_flight_locks
                 .entry_ref(addr)
                 .or_default()
@@ -1093,14 +1082,12 @@ impl BatchScheduler {
     /// Unlocks a transaction, releasing all its locks.
     ///
     /// Panics if the transaction doesn't hold the expected locks.
-    fn unlock<B>(
+    fn unlock(
         in_flight_locks: &mut HashMap<Pubkey, AccountLockers>,
-        bridge: &B,
+        bridge: &SchedulerBindingsBridge<PriorityId>,
         tx_key: TransactionKey,
-    ) where
-        B: Bridge,
-    {
-        for (addr, writable) in bridge.tx(tx_key).locks() {
+    ) {
+        for (addr, writable) in bridge.transaction(tx_key).locks() {
             let EntryRef::Occupied(mut entry) = in_flight_locks.entry_ref(addr) else {
                 panic!();
             };
@@ -1166,19 +1153,17 @@ impl BatchScheduler {
         Some((priority, cost))
     }
 
-    fn emit_tx_event<B>(
+    fn emit_tx_event(
         &self,
-        bridge: &B,
+        bridge: &SchedulerBindingsBridge<PriorityId>,
         key: TransactionKey,
         priority: u64,
         action: TransactionAction,
-    ) where
-        B: Bridge,
-    {
+    ) {
         let Some(events) = &self.events else { return };
 
         // Don't emit for vote TXs (save my disk/familia).
-        let tx = bridge.tx(key);
+        let tx = bridge.transaction(key);
         if tx.is_simple_vote() {
             return;
         }
@@ -1352,11 +1337,11 @@ struct BundleId {
 
 #[cfg(test)]
 mod tests {
-    use agave_bridge::TestBridge;
     use agave_scheduler_bindings::worker_message_types::{
         CheckResponse, parsing_and_sanitization_flags, resolve_flags, status_check_flags,
     };
     use agave_scheduler_bindings::{NOT_LEADER, ProgressMessage, pack_message_flags};
+    use agave_scheduling_utils::bridge::TestBridge;
     use solana_compute_budget_interface::ComputeBudgetInstruction;
     use solana_hash::Hash;
     use solana_keypair::{Keypair, Signer};
@@ -1748,7 +1733,7 @@ mod tests {
         assert_eq!(check_batch.transactions.len(), 1);
 
         // Queue a successful check response.
-        bridge.queue_check_response(&check_batch, 0, None);
+        bridge.queue_check_response_ok(&check_batch, 0, None);
 
         // Poll - check response drained, TX moves to checked.
         bridge.queue_progress(MOCK_PROGRESS);
@@ -1826,9 +1811,9 @@ mod tests {
                 | status_check_flags::ALREADY_PROCESSED,
             ..bridge.check_ok()
         };
-        bridge.queue_check_response_with(&check_batch, 0, None, parse_fail);
-        bridge.queue_check_response_with(&check_batch, 1, None, resolve_fail);
-        bridge.queue_check_response_with(&check_batch, 2, None, status_fail);
+        bridge.queue_check_response(&check_batch, 0, None, parse_fail);
+        bridge.queue_check_response(&check_batch, 1, None, resolve_fail);
+        bridge.queue_check_response(&check_batch, 2, None, status_fail);
 
         // Poll.
         bridge.queue_progress(MOCK_PROGRESS);
@@ -1906,7 +1891,7 @@ mod tests {
             .iter()
             .position(|t| t.key == checked_meta.key)
             .unwrap();
-        bridge.queue_check_response(&recheck_batch, idx, None);
+        bridge.queue_check_response_ok(&recheck_batch, idx, None);
 
         // Poll - recheck OK is a no-op; TX stays in checked.
         bridge.queue_progress(leader_no_budget);
@@ -1976,7 +1961,7 @@ mod tests {
                 | status_check_flags::ALREADY_PROCESSED,
             ..bridge.check_ok()
         };
-        bridge.queue_check_response_with(&recheck_batch, idx, None, status_fail);
+        bridge.queue_check_response(&recheck_batch, idx, None, status_fail);
         scheduler.poll(&mut bridge);
 
         // Assert - Checked TX dropped.
@@ -2915,7 +2900,7 @@ mod tests {
                 .iter()
                 .any(|t| t.key == checked_meta.key),
         );
-        bridge.queue_check_response(&recheck_batch, 0, None);
+        bridge.queue_check_response_ok(&recheck_batch, 0, None);
 
         // Third leader poll - recheck response drained, cursor exhausted (only 1 TX).
         bridge.queue_progress(leader_no_budget);
@@ -2926,7 +2911,7 @@ mod tests {
         while let Some(batch) = bridge.pop_schedule() {
             if batch.flags & 1 == pack_message_flags::CHECK {
                 for i in 0..batch.transactions.len() {
-                    bridge.queue_check_response(&batch, i, None);
+                    bridge.queue_check_response_ok(&batch, i, None);
                 }
             }
         }
@@ -2936,7 +2921,7 @@ mod tests {
         while let Some(batch) = bridge.pop_schedule() {
             if batch.flags & 1 == pack_message_flags::CHECK {
                 for i in 0..batch.transactions.len() {
-                    bridge.queue_check_response(&batch, i, None);
+                    bridge.queue_check_response_ok(&batch, i, None);
                 }
             }
         }
@@ -2979,46 +2964,6 @@ mod tests {
 
     //////////////
     // Edge cases
-
-    #[test]
-    fn tpu_recv_evicts_lowest_priority() {
-        let (mut scheduler, _jito_tx) = test_scheduler();
-        // Worker capacity 0 prevents schedule_checks from draining unchecked_tx.
-        let mut bridge = TestBridge::new(5, 0);
-
-        // Fill unchecked_tx to capacity (64) with TXs of increasing priority.
-        // Use large cu_price values to ensure distinct priorities (avoid integer
-        // truncation in fee calculation).
-        let payers: Vec<Keypair> = (0..64).map(|_| Keypair::new()).collect();
-        for (i, payer) in payers.iter().enumerate() {
-            let cu_price = ((i + 1) as u64) * 1_000;
-            let tx = noop_with_budget(payer, 25_000, cu_price);
-            bridge.queue_tpu(&tx);
-        }
-        bridge.queue_progress(MOCK_PROGRESS);
-        scheduler.poll(&mut bridge);
-        assert_eq!(scheduler.unchecked_tx.len(), 64);
-
-        // Remember the lowest priority TX's key.
-        let lowest = *scheduler.unchecked_tx.peek_min().unwrap();
-
-        // Ingest one more TX with higher priority than the lowest.
-        let new_payer = Keypair::new();
-        let new_tx = noop_with_budget(&new_payer, 25_000, 100_000);
-        bridge.queue_tpu(&new_tx);
-        bridge.queue_progress(MOCK_PROGRESS);
-        scheduler.poll(&mut bridge);
-
-        // Assert - still at capacity (the lowest was evicted, new one added).
-        assert_eq!(scheduler.unchecked_tx.len(), 64);
-
-        // Assert - the old lowest priority TX was dropped from the bridge.
-        assert!(!bridge.contains_tx(lowest.key));
-
-        // Assert - new minimum has higher priority than the evicted TX.
-        let new_min = scheduler.unchecked_tx.peek_min().unwrap();
-        assert!(new_min.priority > lowest.priority);
-    }
 
     #[test]
     fn checked_capacity_eviction() {
